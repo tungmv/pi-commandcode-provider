@@ -398,6 +398,154 @@ function parseJsonLine(line: string, lineNumber: number): unknown {
 	}
 }
 
+// ---- Text-mode tool-call recovery ---------------------------------------
+// Some models routed through /alpha/generate answer with tool-call markup in
+// the *text* channel instead of emitting `tool-input-*` events. The gateway
+// reports finishReason "stop" for those, so without this the call is silently
+// dropped: the turn looks like a normal answer and the agent loop stalls.
+//
+// Two markup families have been observed from DeepSeek v4/v4.1 behind pi's
+// real prompt (long system prompt, ~15 tools, a long thinking block):
+//
+//   1. DSML-ish, pipe-decorated with a tag name:
+//
+//        [PIPE]DSML[PIPE] calls
+//        [PIPE]DSML[PIPE] invoke name="bash"
+//        [PIPE]DSML[PIPE] parameter name="command" string="true">...
+//        [PIPE]DSML[PIPE] /invoke
+//
+//   2. An OpenAI/Hermes-style function envelope:
+//
+//        [LT]tool_call[GT]
+//        [LT]function name="bash"[GT]
+//        [LT]parameter name="command"[GT]...[/parameter]
+//        [/function]
+//        [/tool_call]
+//
+// The pipe decoration is not one fixed spelling: `[PIPE][PIPE]DSML[PIPE][PIPE]`,
+// `[PIPE]|DSML|[PIPE]`, and a bare tag have all been seen. So the patterns
+// below take an optional run of pipe-ish characters plus an optional tag name
+// on either side of the element name, and the function envelope is tried as a
+// second shape. Values may be JSON, a JSON string literal, or bare text.
+
+const PIPE = "[|｜]";
+const TAG_NAME = "[A-Za-z_][\\w.-]*";
+const TAG_PREFIX = `(?:${PIPE}{1,4}${TAG_NAME}${PIPE}{1,4}|${PIPE}{1,4})?`;
+
+// DSML family: an invoke element wrapping parameter elements.
+const INVOKE_RE = new RegExp(
+	`<\\s*${TAG_PREFIX}\\s*invoke\\b([^>]*)>([\\s\\S]*?)<\\s*\\/\\s*${TAG_PREFIX}\\s*invoke\\s*>`,
+	"gi",
+);
+// Function envelope: an element whose name is the tool, wrapping parameter elements.
+const FUNCTION_RE =
+	/<\s*function\b([^>]*)>([\s\S]*?)<\s*\/\s*function\s*>/gi;
+const PARAMETER_RE = new RegExp(
+	`<\\s*${TAG_PREFIX}\\s*parameter\\b([^>]*)>([\\s\\S]*?)<\\s*\\/\\s*${TAG_PREFIX}\\s*parameter\\s*>`,
+	"gi",
+);
+const NAME_ATTR_RE = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i;
+// Closing tag for the envelope form, used to strip leftovers.
+const STRIP_TAG_RE = new RegExp(
+	`<\\s*\\/?\\s*${TAG_PREFIX}\\s*\\/?\\s*(?:invoke|function|parameter|calls?|tool_call)\\b[^>]*>`,
+	"gi",
+);
+// `string="true"` marks values the model meant as a raw string rather than JSON.
+const PARAMETER_STRING_ATTR_RE = /\bstring\s*=\s*(?:"true"|'true'|true)/i;
+
+function attrString(match: RegExpMatchArray | null): string {
+	return (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim();
+}
+
+function decodeAttributeValue(value: string): string {
+	return value
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;|&apos;/g, "'")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&");
+}
+
+// Coerce a parameter body into the JSON value pi's tool arguments need. The
+// model may send real JSON, a JSON string literal, or bare text.
+function coerceParameterValue(raw: string, isStringAttr: boolean): unknown {
+	const value = raw.trim();
+	if (!isStringAttr && value) {
+		try {
+			return JSON.parse(value);
+		} catch {
+			// Not JSON; fall through and treat it as text.
+		}
+	}
+	return decodeAttributeValue(value);
+}
+
+// Collect the `parameter` children of one invoke/function body.
+function collectArguments(body: string): Record<string, unknown> {
+	const args: Record<string, unknown> = {};
+	PARAMETER_RE.lastIndex = 0;
+	let parameter: RegExpExecArray | null;
+	while ((parameter = PARAMETER_RE.exec(body)) !== null) {
+		const [, paramAttrs = "", raw = ""] = parameter;
+		const paramName = attrString(NAME_ATTR_RE.exec(paramAttrs));
+		if (!paramName) continue;
+		args[paramName] = coerceParameterValue(
+			raw,
+			PARAMETER_STRING_ATTR_RE.test(paramAttrs),
+		);
+	}
+	return args;
+}
+
+// Does this text look like a model emitted a tool call as text?
+function looksLikeToolMarkup(text: string): boolean {
+	return (
+		new RegExp(`<\\s*${TAG_PREFIX}\\s*invoke\\b`, "i").test(text) ||
+		/<\s*function\b/i.test(text)
+	);
+}
+
+type RecoveredToolCall = { name: string; arguments: Record<string, unknown> };
+
+// Parse every tool call in a text block, in both the DSML invoke shape and the
+// function-envelope shape. Returns [] when the text has no usable markup, so
+// callers can leave ordinary prose alone.
+function recoverToolCalls(text: string): RecoveredToolCall[] {
+	const calls: RecoveredToolCall[] = [];
+
+	INVOKE_RE.lastIndex = 0;
+	let invoke: RegExpExecArray | null;
+	while ((invoke = INVOKE_RE.exec(text)) !== null) {
+		const [, attrs = "", body = ""] = invoke;
+		const name = attrString(NAME_ATTR_RE.exec(attrs));
+		if (!name) continue;
+		calls.push({ name, arguments: collectArguments(body) });
+	}
+
+	FUNCTION_RE.lastIndex = 0;
+	let fn: RegExpExecArray | null;
+	while ((fn = FUNCTION_RE.exec(text)) !== null) {
+		const [, attrs = "", body = ""] = fn;
+		const name = attrString(NAME_ATTR_RE.exec(attrs));
+		if (!name) continue;
+		calls.push({ name, arguments: collectArguments(body) });
+	}
+
+	return calls;
+}
+
+// Strip the markup out of a text block so the leftover prose is not duplicated
+// alongside the recovered tool calls.
+function stripToolMarkup(text: string): string {
+	return text
+		.replace(INVOKE_RE, "")
+		.replace(FUNCTION_RE, "")
+		.replace(STRIP_TAG_RE, "")
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
 function convertMessages(messages: Message[]): CmdMessage[] {
 	const out: CmdMessage[] = [];
 	// Track tool call names by id so tool-result messages can fill `toolName`
@@ -800,6 +948,55 @@ function streamCommandCode(
 			}
 			if (!sawTerminalEvent) {
 				throw new Error("Command Code stream ended before a terminal event");
+			}
+
+			// A model can answer with tool-call markup in the text channel instead of
+			// `tool-input-*` events. Recover those before reporting "stop", or pi sees
+			// an ordinary answer and the agent loop stalls. Only runs when the gateway
+			// sent no structured tool calls at all, so it cannot double up.
+			if (!output.content.some((block) => block.type === "toolCall")) {
+				for (let idx = 0; idx < output.content.length; idx++) {
+					const block = output.content[idx];
+					if (block.type !== "text") continue;
+					if (!looksLikeToolMarkup(block.text)) continue;
+
+					const recovered = recoverToolCalls(block.text);
+					if (recovered.length === 0) continue;
+
+					const residue = stripToolMarkup(block.text);
+					if (residue) {
+						block.text = residue;
+					} else {
+						// Nothing but markup: drop the empty text block.
+						output.content.splice(idx, 1);
+						idx--;
+					}
+
+					for (const call of recovered) {
+						const id = `call_recovered_${idx}_${output.content.length}`;
+						output.content.push({
+							type: "toolCall",
+							id,
+							name: call.name,
+							arguments: call.arguments,
+						});
+						stream.push({
+							type: "toolcall_end",
+							contentIndex: output.content.length - 1,
+							toolCall: {
+								type: "toolCall",
+								id,
+								name: call.name,
+								arguments: call.arguments,
+							},
+							partial: output,
+						});
+					}
+				}
+
+				if (output.content.some((block) => block.type === "toolCall")) {
+					output.stopReason = "toolUse";
+				}
 			}
 
 			stream.push({
