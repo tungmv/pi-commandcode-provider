@@ -56,6 +56,9 @@ Pulled from `GET /provider/v1/models` and the CLI registry, then registered with
 
 | Model id                              | Display name              | Context | Max out |
 | ------------------------------------- | ------------------------- | ------- | ------- |
+| `deepseek/deepseek-v4.1-flash`          | DeepSeek V4.1 Flash       | 1M      | 128K    |
+| `deepseek/deepseek-v4.1-flash-fast`    | DeepSeek V4.1 Flash Fast  | 1M      | 128K    |
+| `deepseek/deepseek-v4.1-flash-ultrafast` | DeepSeek V4.1 Flash Ultrafast | 1M | 128K |
 | `deepseek/deepseek-v4-pro`            | DeepSeek V4 Pro           | 1M      | 128K    |
 | `deepseek/deepseek-v4-flash`          | DeepSeek V4 Flash         | 1M      | 128K    |
 | `moonshotai/Kimi-K3`                  | Kimi K3                   | 1M      | 64K     |

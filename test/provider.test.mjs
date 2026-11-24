@@ -26,6 +26,9 @@ const model = {
 test("model registry includes the current OSS roster and vision capabilities", () => {
 	const byID = new Map(provider.models.map((entry) => [entry.id, entry]));
 	for (const id of [
+		"deepseek/deepseek-v4.1-flash",
+		"deepseek/deepseek-v4.1-flash-fast",
+		"deepseek/deepseek-v4.1-flash-ultrafast",
 		"moonshotai/Kimi-K3",
 		"zai-org/GLM-5.2-Fast",
 		"tencent/Hy3",

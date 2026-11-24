@@ -83,6 +83,33 @@ const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const MODELS: ModelDef[] = [
 	// DeepSeek
 	{
+		id: "deepseek/deepseek-v4.1-flash",
+		name: "DeepSeek V4.1 Flash (Command Code)",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 1_000_000,
+		maxTokens: 131072,
+		cost: ZERO_COST,
+	},
+	{
+		id: "deepseek/deepseek-v4.1-flash-fast",
+		name: "DeepSeek V4.1 Flash Fast (Command Code)",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 1_000_000,
+		maxTokens: 131072,
+		cost: ZERO_COST,
+	},
+	{
+		id: "deepseek/deepseek-v4.1-flash-ultrafast",
+		name: "DeepSeek V4.1 Flash Ultrafast (Command Code)",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 1_048_576,
+		maxTokens: 131072,
+		cost: ZERO_COST,
+	},
+	{
 		id: "deepseek/deepseek-v4-pro",
 		name: "DeepSeek V4 Pro (Command Code)",
 		reasoning: true,
