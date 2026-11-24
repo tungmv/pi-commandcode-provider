@@ -37,10 +37,14 @@ import {
 	type AssistantMessageEventStream,
 	type Context,
 	type Message,
+	type JsonObject,
 	type Model,
+	type Tool,
 	type SimpleStreamOptions,
 	calculateCost,
 	createAssistantMessageEventStream,
+	getCurrentSystemPrompt,
+	getCurrentTools,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -538,6 +542,177 @@ function escapeRegExp(literal: string): string {
 	return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// ---- Tool-name resolution ------------------------------------------------
+// The model names tools the way it has seen them named elsewhere: `Bash`,
+// `read_file`, `edit_file`, `glob`, `explore`. pi dispatches the name
+// verbatim, so an unresolved name surfaces as "Tool bash not found" and the
+// call is wasted — worse than not recovering it, because the model then retries
+// the same wrong name. Recovered names (and the gateway's own `toolName`) are
+// therefore resolved against the tools this request actually declared:
+//
+//   1. exact      `bash`      -> `bash`
+//   2. case       `Bash`      -> `bash`
+//   3. alias      `read_file` -> `read`   (only if `read` is declared)
+//   4. arg shape  `glob` {pattern} -> the one declared tool that needs `pattern`
+//
+// Nothing resolves when the request declared no tools (print mode without
+// `--tools`) or when no candidate is declared; the name is then left alone so
+// the failure stays visible instead of silently swallowing the call.
+
+const TOOL_NAME_ALIASES: Record<string, string[]> = {
+	bash: ["bash_tool", "run_bash", "execute_bash", "shell", "terminal"],
+	read: ["read_file", "view_file", "open_file", "cat"],
+	edit: ["edit_file", "apply_edit", "str_replace", "patch_file"],
+	write: ["write_file", "create_file", "save_file"],
+	edit_file: ["edit_file"],
+	grep: ["grep_search", "search_files", "ripgrep"],
+	ffgrep: ["grep", "grep_search", "search", "rg"],
+	find: ["glob", "find_files", "list_files"],
+	fffind: ["glob", "find_files", "list_files"],
+	ls: ["list_dir", "ls_dir", "list_directory"],
+};
+
+function resolveToolName(name: string, specs: ToolSpec[]): string | null {
+	if (!name) return null;
+	if (specs.length === 0) return null;
+
+	const exact = specs.find((spec) => spec.name === name);
+	if (exact) return exact.name;
+
+	const lower = name.toLowerCase();
+	const byCase = specs.find((spec) => spec.name.toLowerCase() === lower);
+	if (byCase) return byCase.name;
+
+	for (const [canonical, aliases] of Object.entries(TOOL_NAME_ALIASES)) {
+		if (!aliases.includes(lower)) continue;
+		const target =
+			specs.find((spec) => spec.name.toLowerCase() === canonical) ??
+			specs.find((spec) => spec.name.toLowerCase() === `${canonical}_tool`);
+		if (target) return target.name;
+	}
+
+	return null;
+}
+
+// Last resort: match by the arguments the call carries. `edit_file` with
+// `path` + `edits` can only be the declared tool that requires exactly those.
+// Ambiguity stays unresolved rather than guessing.
+function matchToolByArguments(
+	args: Record<string, unknown>,
+	specs: ToolSpec[],
+): string | null {
+	const keys = Object.keys(args);
+	if (keys.length === 0) return null;
+	const candidates = specs.filter(
+		(spec) =>
+			spec.required.length > 0 &&
+			spec.required.every((key) => keys.includes(key)),
+	);
+	if (candidates.length !== 1) return null;
+	return candidates[0].name;
+}
+
+function resolveRecoveredName(
+	call: RecoveredToolCall,
+	specs: ToolSpec[],
+): string {
+	return (
+		resolveToolName(call.name, specs) ??
+		matchToolByArguments(call.arguments, specs) ??
+		call.name
+	);
+}
+
+// ---- Argument normalization ----------------------------------------------
+// A resolved tool still needs arguments pi's schema accepts. The model, primed
+// by other harnesses' conventions, spells the same argument differently:
+//
+//   read_file { file_path }       -> read   { path }
+//   edit_file { path, old_string, new_string } -> edit { path, edits: [{oldText,newText}] }
+//
+// Unknown keys are dropped: pi validates declared arguments, and a stray
+// `description` on `bash` would otherwise reject the whole call. Values keep
+// the type their declared schema wants.
+
+const PROPERTY_ALIASES: Record<string, string[]> = {
+	path: ["file_path", "filepath", "filePath", "filename", "file"],
+	command: ["cmd", "shell_command", "script"],
+	content: ["file_text", "fileText", "text", "contents"],
+	pattern: ["query", "search", "regex", "glob_pattern"],
+	limit: ["max_results", "maxResults", "count"],
+	oldText: ["old_string", "oldString", "old_text", "search", "find"],
+	newText: ["new_string", "newString", "new_text", "replace", "replacement"],
+	edits: ["replacements", "changes", "patch"],
+};
+
+function canonicalProperty(key: string, spec: ToolSpec): string | null {
+	if (spec.properties.has(key)) return key;
+	// Aliases work in both directions: `file_path` finds `path`, and a declared
+	// `file_path` is found from the canonical `path`.
+	for (const [declared, aliases] of Object.entries(PROPERTY_ALIASES)) {
+		if (!spec.properties.has(declared)) continue;
+		const squashed = key.replace(/_/g, "").toLowerCase();
+		if (
+			aliases.some(
+				(alias) =>
+					alias === key || alias.replace(/_/g, "").toLowerCase() === squashed,
+			)
+		)
+			return declared;
+	}
+	// A `filePath`/`file_path`-style variant of a declared camelCase property.
+	const squashed = key.replace(/_/g, "").toLowerCase();
+	for (const declared of spec.properties.keys()) {
+		if (declared.replace(/_/g, "").toLowerCase() === squashed) return declared;
+	}
+	return null;
+}
+
+// pi's `edit` tool takes `edits` as an array of {oldText, newText}. Models that
+// know a str_replace-style tool send the pair as flat arguments instead.
+function synthesizeEdits(
+	args: Record<string, unknown>,
+	spec: ToolSpec,
+): void {
+	if (!spec.properties.has("edits") || args.edits !== undefined) return;
+	const old =
+		args.oldText ?? args.old_string ?? args.oldString ?? args.old_text;
+	const replacement =
+		args.newText ?? args.new_string ?? args.newString ?? args.new_text;
+	if (typeof old !== "string" || typeof replacement !== "string") return;
+	args.edits = [{ oldText: old, newText: replacement }];
+}
+
+function normalizeCallArguments(
+	args: Record<string, unknown>,
+	spec: ToolSpec | undefined,
+): Record<string, unknown> {
+	if (!spec) return args;
+	synthesizeEdits(args, spec);
+
+	const normalized: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(args)) {
+		const declared = canonicalProperty(key, spec);
+		if (!declared) continue;
+		if (normalized[declared] !== undefined) continue;
+		const schema = spec.properties.get(declared);
+		normalized[declared] = coerceTypedValue(
+			typeof value === "string" ? value : JSON.stringify(value),
+			schema ?? {},
+		);
+	}
+	return normalized;
+}
+
+function resolveCall(
+	call: RecoveredToolCall,
+	specs: ToolSpec[],
+): RecoveredToolCall {
+	const name = resolveRecoveredName(call, specs);
+	const spec = specs.find((entry) => entry.name === name);
+	return { name, arguments: normalizeCallArguments(call.arguments, spec) };
+}
+
 function toolBlockRe(name: string): RegExp {
 	const TAG = escapeRegExp(name);
 	return new RegExp(
@@ -757,7 +932,10 @@ function recoverToolCalls(
 	calls.push(...recoverToolBlocks(text, specs));
 	calls.push(...recoverNameLineBlocks(text, specs));
 
-	return calls;
+	// Resolve every recovered name against the declared tools before it can
+	// reach pi, which dispatches names verbatim, and reshape the arguments to the
+	// schema that name won.
+	return calls.map((call) => resolveCall(call, specs));
 }
 
 // Strip the markup out of a text block so the leftover prose is not duplicated
@@ -892,6 +1070,21 @@ function toolEventName(event: GatewayEvent): string {
 	return event.toolName ?? event.name ?? "";
 }
 
+// ---- Transcript → request ------------------------------------------------
+// The current tool set lives in the transcript's system messages. Return null
+// when no system message declares any, so callers can fall back to the legacy
+// top-level `context.tools` field instead of sending an empty tool list.
+function toolsFromTranscript(context: Context): Tool[] | null {
+	const counts = context.messages.some(
+		(message) =>
+			message.role === "system" &&
+			(((message.toolsAdded?.length ?? 0) > 0) ||
+				((message.toolsRemoved?.length ?? 0) > 0)),
+	);
+	if (!counts) return null;
+	return getCurrentTools(context.messages);
+}
+
 // ---- Stream implementation ----------------------------------------------
 
 function streamCommandCode(
@@ -926,7 +1119,22 @@ function streamCommandCode(
 
 			stream.push({ type: "start", partial: output });
 
-			const tools = (context.tools ?? []).map((t) => ({
+			// pi hands providers a TranscriptContext: the prompt and the tool
+			// declarations live in the transcript's system messages (`sections`,
+			// `toolsAdded`), not in top-level `systemPrompt`/`tools` fields. Reading
+			// those directly yields an empty tool list, so the model is offered no
+			// tools at all and answers with tool-call markup in the text channel
+			// instead of `tool-input-*` events. Replay the transcript to recover both.
+			// The top-level fields are still honoured for older cores and for direct
+			// `streamSimple()` calls from tests and other SDK users.
+			const declaredTools =
+				(toolsFromTranscript(context) ?? context.tools ?? []);
+			const systemPrompt =
+				getCurrentSystemPrompt(context.messages) ||
+				context.systemPrompt ||
+				"";
+
+			const tools = declaredTools.map((t) => ({
 				name: t.name,
 				description: t.description,
 				input_schema: t.parameters,
@@ -941,7 +1149,7 @@ function streamCommandCode(
 				permissionMode: "standard",
 				params: {
 					model: model.id,
-					system: context.systemPrompt ?? "",
+					system: systemPrompt,
 					messages: convertMessages(context.messages),
 					tools,
 					max_tokens: options?.maxTokens ?? model.maxTokens ?? 8192,
@@ -1049,10 +1257,11 @@ function streamCommandCode(
 					case "tool-input-start": {
 						const id = toolEventId(gatewayEvent);
 						if (!id) break;
+						const name = resolveToolName(toolEventName(gatewayEvent), recoverySpecs) ?? toolEventName(gatewayEvent);
 						output.content.push({
 							type: "toolCall",
 							id,
-							name: toolEventName(gatewayEvent),
+							name,
 							arguments: {},
 						});
 						const idx = output.content.length - 1;
@@ -1085,10 +1294,11 @@ function streamCommandCode(
 						if (!id) break;
 						let idx = idToIndex.get(id);
 						if (idx === undefined) {
+							const rawName = toolEventName(gatewayEvent);
 							output.content.push({
 								type: "toolCall",
 								id,
-								name: toolEventName(gatewayEvent),
+								name: resolveToolName(rawName, recoverySpecs) ?? rawName,
 								arguments: {},
 							});
 							idx = output.content.length - 1;
@@ -1111,6 +1321,12 @@ function streamCommandCode(
 						}
 						if (endedToolCalls.has(idx)) break;
 						endedToolCalls.add(idx);
+						// A structured call can still carry another harness's argument spelling;
+						// normalise it to the schema of the tool that was actually declared.
+						block.arguments = normalizeCallArguments(
+							block.arguments as Record<string, unknown>,
+							recoverySpecs.find((spec) => spec.name === block.name),
+						) as JsonObject;
 						stream.push({
 							type: "toolcall_end",
 							contentIndex: idx,
@@ -1206,7 +1422,7 @@ function streamCommandCode(
 							type: "toolCall",
 							id,
 							name: call.name,
-							arguments: call.arguments,
+							arguments: call.arguments as JsonObject,
 						});
 						stream.push({
 							type: "toolcall_end",
@@ -1215,7 +1431,7 @@ function streamCommandCode(
 								type: "toolCall",
 								id,
 								name: call.name,
-								arguments: call.arguments,
+								arguments: call.arguments as JsonObject,
 							},
 							partial: output,
 						});

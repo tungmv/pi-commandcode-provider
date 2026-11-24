@@ -471,3 +471,211 @@ test("recovers a tool_call wrapper with a Name: value body", async (t) => {
 	assert.equal(events.at(-1).reason, "toolUse");
 	assert.ok(!JSON.stringify(events.at(-1).message).includes("tool_call"));
 });
+
+// ---- Tool-name resolution ------------------------------------------------
+// pi dispatches a tool name verbatim, so a recovered `Bash` (or `read_file`,
+// `edit_file`, `glob`) used to reach execution as "Tool Bash not found". Every
+// recovered name must land on a tool the request actually declared; anything
+// else stays visible instead of being guessed.
+
+const PI_TOOLSET = [
+	BASH_TOOL,
+	{
+		name: "read",
+		description: "Read a file",
+		parameters: {
+			type: "object",
+			required: ["path"],
+			properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } },
+		},
+	},
+	{
+		name: "edit",
+		description: "Edit a file",
+		parameters: {
+			type: "object",
+			required: ["path", "edits"],
+			properties: { path: { type: "string" }, edits: { type: "array" } },
+		},
+	},
+	{
+		name: "fffind",
+		description: "Find files",
+		parameters: {
+			type: "object",
+			required: ["pattern"],
+			properties: { pattern: { type: "string" }, path: { type: "string" } },
+		},
+	},
+];
+
+test("a capitalized tool name resolves to the declared lowercase tool", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			'<｜｜DSML｜｜ invoke name="Bash"><｜｜DSML｜｜ parameter name="command">ls ~/.config/hypr</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>',
+		),
+		PI_TOOLSET,
+	);
+
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.equal(toolEnd.toolCall.name, "bash");
+	assert.deepEqual(toolEnd.toolCall.arguments, { command: "ls ~/.config/hypr" });
+});
+
+test("a foreign tool name aliases onto the declared tool with compatible arguments", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			'<tool_call><function name="read_file">' +
+				'<parameter name="path">/tmp/a.lua</parameter>' +
+				"<parameter name=\"limit\">40</parameter>" +
+				"</function></tool_call>",
+		),
+		PI_TOOLSET,
+	);
+
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.equal(toolEnd.toolCall.name, "read");
+	assert.deepEqual(toolEnd.toolCall.arguments, { path: "/tmp/a.lua", limit: 40 });
+});
+
+test("an unresolvable tool name is left alone rather than guessed", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			'<｜｜DSML｜｜ invoke name="explore"><｜｜DSML｜｜ parameter name="messages">find the config</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>',
+		),
+		PI_TOOLSET,
+	);
+
+	// Nothing declared takes `messages`; the failure stays visible to the model.
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.equal(toolEnd.toolCall.name, "explore");
+});
+
+test("declared-path aliases and str_replace pairs are reshaped for pi", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			'<｜｜DSML｜｜ invoke name="edit_file">' +
+				'<｜｜DSML｜｜ parameter name="file_path">/tmp/a.lua</｜｜DSML｜｜ parameter>' +
+				'<｜｜DSML｜｜ parameter name="old_string">old</｜｜DSML｜｜ parameter>' +
+				'<｜｜DSML｜｜ parameter name="new_string">new</｜｜DSML｜｜ parameter>' +
+				"</｜｜DSML｜｜ invoke>",
+		),
+		PI_TOOLSET,
+	);
+
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.equal(toolEnd.toolCall.name, "edit");
+	assert.deepEqual(toolEnd.toolCall.arguments, {
+		path: "/tmp/a.lua",
+		edits: [{ oldText: "old", newText: "new" }],
+	});
+});
+
+test("undeclared arguments are dropped instead of reaching pi's validator", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			'<tool_call><function name="Bash">' +
+				'<parameter name="command">pwd</parameter>' +
+				'<parameter name="description">print working dir</parameter>' +
+				"</function></tool_call>",
+		),
+		[BASH_TOOL],
+	);
+
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.deepEqual(toolEnd.toolCall.arguments, { command: "pwd" });
+});
+
+test("unresolved names survive when the request declared no tools", async (t) => {
+	// Print mode without --tools sends no schemas; recovery must not invent a
+	// target from nothing.
+	const events = await runStream(
+		t,
+		textModeStream('<｜｜DSML｜｜ invoke name="glob"><｜｜DSML｜｜ parameter name="pattern">*.lua</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>'),
+		[],
+	);
+
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.equal(toolEnd.toolCall.name, "glob");
+});
+
+// ---- TranscriptContext ---------------------------------------------------
+// pi hands providers a normalized TranscriptContext: the prompt and the tool
+// declarations live in the transcript's system messages (`sections`,
+// `toolsAdded`), and there is no top-level `systemPrompt`/`tools`. Reading
+// those top-level fields directly sent an empty tool list, which is what made
+// the model answer with tool-call markup in the text channel in the first
+// place.
+
+function transcriptContext(systemPrompt, tools, messages = []) {
+	return {
+		messages: [
+			{
+				// pi's leading system message carries the prompt in `sections`; `content`
+				// is empty (later system messages use it for extra instructions).
+				role: "system",
+				content: "",
+				sections: { preamble: systemPrompt },
+				toolsAdded: tools,
+				timestamp: 0,
+			},
+			...messages,
+		],
+	};
+}
+
+async function runTranscriptStream(t, body, context) {
+	let request;
+	t.mock.method(globalThis, "fetch", async (_url, init) => {
+		request = JSON.parse(init.body);
+		return new Response(body, { status: 200, headers: { "content-type": "application/x-ndjson" } });
+	});
+
+	const events = [];
+	for await (const event of provider.streamSimple(model, context, { apiKey: "user_test" })) {
+		events.push(event);
+	}
+	return { events, request };
+}
+
+test("tool declarations and prompt are read from the transcript's system messages", async (t) => {
+	const { request } = await runTranscriptStream(
+		t,
+		textModeStream('<tool_call><function name="Bash"><parameter name="command">pwd</parameter></function></tool_call>'),
+		transcriptContext("SYSTEM-PROMPT-MARKER", [BASH_TOOL]),
+	);
+
+	assert.equal(request.params.system, "SYSTEM-PROMPT-MARKER");
+	assert.deepEqual(request.params.tools.map((tool) => tool.name), ["bash"]);
+});
+
+test("a transcript-declared tool set still resolves a capitalized tool name", async (t) => {
+	const { events } = await runTranscriptStream(
+		t,
+		textModeStream(
+			'<｜｜DSML｜｜ invoke name="Bash"><｜｜DSML｜｜ parameter name="command">ls ~/.config/hypr</｜｜DSML｜｜ parameter>' +
+				'<｜｜DSML｜｜ parameter name="description">List dir</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>',
+		),
+		transcriptContext("prompt", [BASH_TOOL]),
+	);
+
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.equal(toolEnd.toolCall.name, "bash");
+	assert.deepEqual(toolEnd.toolCall.arguments, { command: "ls ~/.config/hypr" });
+});
+
+test("a raw Context with top-level tools still works for direct SDK callers", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream('<tool_call><function name="Bash"><parameter name="command">pwd</parameter></function></tool_call>'),
+		[BASH_TOOL],
+	);
+
+	const toolEnd = events.find((e) => e.type === "toolcall_end");
+	assert.equal(toolEnd.toolCall.name, "bash");
+});
