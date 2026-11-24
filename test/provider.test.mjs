@@ -140,7 +140,7 @@ function textModeStream(text) {
 	].join("\n");
 }
 
-async function runStream(t, body) {
+async function runStream(t, body, tools = []) {
 	// The stream must be iterated only after fetch is mocked, or the extension
 	// escapes into the real gateway.
 	t.mock.method(globalThis, "fetch", async () => {
@@ -150,7 +150,7 @@ async function runStream(t, body) {
 	const events = [];
 	const stream = provider.streamSimple(
 		model,
-		{ systemPrompt: "", messages: [], tools: [] },
+		{ systemPrompt: "", messages: [], tools },
 		{ apiKey: "user_test" },
 	);
 	for await (const event of stream) events.push(event);
@@ -291,4 +291,183 @@ test("recovers a Hermes-style function envelope", async (t) => {
 	const done = events.at(-1);
 	assert.equal(done.reason, "toolUse");
 	assert.ok(!JSON.stringify(done.message).includes("tool_call"));
+});
+
+// ---- Schema-matched tool elements ---------------------------------------
+// A third family names the tool as the element and arguments as children, with
+// no invoke wrapper. Captured live from DeepSeek v4.1 Flash on Command Code:
+//
+//   <bash>
+//   <command>pwd</command>
+//   <description>Print current working directory</description>
+//   </bash>
+
+const BASH_TOOL = {
+	name: "bash",
+	description: "Execute a shell command",
+	parameters: {
+		type: "object",
+		properties: {
+			command: { type: "string" },
+			timeout: { type: "number" },
+		},
+		required: ["command"],
+	},
+};
+
+test("recovers a tool-element block matching a live tool name", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			"I'll run those three independent commands in parallel.\n\n" +
+				"<bash>\n<command>pwd</command>\n<description>Print current working directory</description>\n</bash>\n" +
+				"<bash>\n<command>ls /tmp | wc -l</command>\n<description>Count entries in /tmp</description>\n</bash>",
+		),
+		[BASH_TOOL],
+	);
+
+	const toolEnds = events.filter((e) => e.type === "toolcall_end");
+	assert.equal(toolEnds.length, 2);
+	assert.deepEqual(
+		toolEnds.map((e) => e.toolCall.arguments.command),
+		["pwd", "ls /tmp | wc -l"],
+	);
+	// Undeclared children are dropped, not sent as bogus arguments.
+	for (const end of toolEnds) assert.equal(end.toolCall.arguments.description, undefined);
+
+	const done = events.at(-1);
+	assert.equal(done.reason, "toolUse");
+	assert.ok(!JSON.stringify(done.message).includes("<bash>"));
+	assert.match(
+		done.message.content.find((b) => b.type === "text").text,
+		/three independent commands/,
+	);
+});
+
+test("tool-element recovery stays inert when the element is not a tool", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream("The build step is <bash>not a tool here</bash> in prose."),
+		[],
+	);
+
+	assert.equal(events.filter((e) => e.type === "toolcall_end").length, 0);
+	const done = events.at(-1);
+	assert.equal(done.reason, "stop");
+	assert.equal(done.message.stopReason, "stop");
+});
+
+test("tool-element recovery needs a declared child argument", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream("<bash><unknown>pwd</unknown></bash>"),
+		[BASH_TOOL],
+	);
+
+	assert.equal(events.filter((e) => e.type === "toolcall_end").length, 0);
+	assert.equal(events.at(-1).reason, "stop");
+});
+
+test("tool-element values follow the declared schema types", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			"<bash>\n<command>make test</command>\n<timeout>45</timeout>\n</bash>\n" +
+				"<read>\n<file_path>/tmp/a.lua</file_path>\n</read>",
+		),
+		[
+			BASH_TOOL,
+			{
+				name: "read",
+				description: "Read a file",
+				parameters: { type: "object", properties: { file_path: { type: "string" } } },
+			},
+		],
+	);
+
+	const toolEnds = events.filter((e) => e.type === "toolcall_end");
+	assert.equal(toolEnds.length, 2);
+	assert.deepEqual(toolEnds[0].toolCall.arguments, { command: "make test", timeout: 45 });
+	assert.equal(typeof toolEnds[0].toolCall.arguments.timeout, "number");
+	assert.deepEqual(toolEnds[1].toolCall.arguments, { file_path: "/tmp/a.lua" });
+});
+
+test("structured tool calls still win over tool-element text", async (t) => {
+	const body = [
+		'{"type":"start"}',
+		'{"type":"text-start","id":"txt-0"}',
+		'{"type":"text-delta","id":"txt-0","text":"<bash><command>echo text</command></bash>"}',
+		'{"type":"text-end","id":"txt-0"}',
+		'{"type":"tool-input-start","id":"call_1","toolName":"bash"}',
+		'{"type":"tool-input-delta","id":"call_1","delta":"{\\"command\\":\\"echo real\\"}"}',
+		'{"type":"tool-input-end","id":"call_1"}',
+		'{"type":"finish-step","finishReason":"tool-calls","usage":{"inputTokens":10,"outputTokens":5}}',
+	].join("\n");
+
+	const events = await runStream(t, body, [BASH_TOOL]);
+	const toolEnds = events.filter((e) => e.type === "toolcall_end");
+	assert.equal(toolEnds.length, 1);
+	assert.deepEqual(toolEnds[0].toolCall.arguments, { command: "echo real" });
+});
+
+test("recovers a bare tool element whose body is the sole required value", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream(
+			"I'll run those three commands separately.\n\n" +
+				"<bash>pwd</bash>\n\n<bash>ls /tmp | wc -l</bash>\n\n<bash>uname -r</bash>\n\nAll three ran:",
+		),
+		[BASH_TOOL],
+	);
+
+	const toolEnds = events.filter((e) => e.type === "toolcall_end");
+	assert.equal(toolEnds.length, 3);
+	assert.deepEqual(
+		toolEnds.map((e) => e.toolCall.arguments.command),
+		["pwd", "ls /tmp | wc -l", "uname -r"],
+	);
+	assert.equal(events.at(-1).reason, "toolUse");
+});
+
+test("bare tool elements stay inert mid-sentence and without a sole required arg", async (t) => {
+	// Prose mentioning the markup must not become a call.
+	const prose = await runStream(
+		t,
+		textModeStream("the form <bash>ls</bash> keeps getting emitted"),
+		[BASH_TOOL],
+	);
+	assert.equal(prose.filter((e) => e.type === "toolcall_end").length, 0);
+
+	// A tool with no single required property is ambiguous; do not guess.
+	const readish = await runStream(
+		t,
+		textModeStream("<read>/tmp/a.lua</read>"),
+		[
+			{
+				name: "read",
+				description: "Read a file",
+				parameters: {
+					type: "object",
+					properties: { file_path: { type: "string" }, limit: { type: "number" } },
+				},
+			},
+		],
+	);
+	assert.equal(readish.filter((e) => e.type === "toolcall_end").length, 0);
+});
+
+test("recovers a tool_call wrapper with a Name: value body", async (t) => {
+	const events = await runStream(
+		t,
+		textModeStream("I'll run that command for you.\n\n<tool_call>\nBash: echo HELLO_REAL\n</tool_call>"),
+		[BASH_TOOL],
+	);
+
+	const toolEnds = events.filter((e) => e.type === "toolcall_end");
+	assert.equal(toolEnds.length, 1);
+	// Capitalized `Bash` maps onto pi's lowercase `bash`.
+	assert.equal(toolEnds[0].toolCall.name, "bash");
+	assert.deepEqual(toolEnds[0].toolCall.arguments, { command: "echo HELLO_REAL" });
+	assert.equal(events.at(-1).reason, "toolUse");
+	assert.ok(!JSON.stringify(events.at(-1).message).includes("tool_call"));
 });

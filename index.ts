@@ -498,19 +498,242 @@ function collectArguments(body: string): Record<string, unknown> {
 }
 
 // Does this text look like a model emitted a tool call as text?
-function looksLikeToolMarkup(text: string): boolean {
+function looksLikeToolMarkup(text: string, specs: ToolSpec[]): boolean {
 	return (
 		new RegExp(`<\\s*${TAG_PREFIX}\\s*invoke\\b`, "i").test(text) ||
-		/<\s*function\b/i.test(text)
+		/<\s*function\b/i.test(text) ||
+		/<\s*tool_call\s*>/i.test(text) ||
+		specs.some((spec) => toolBlockRe(spec.name).test(text))
 	);
+}
+
+// ---- Schema-aware tool blocks -------------------------------------------
+// A third family names the *tool* as the element and each argument as a child
+// element, with no invocation wrapper:
+//
+//   [LT]bash[GT]
+//   [LT]command[GT]pwd[/command]
+//   [LT]description[GT]Print current working directory[/description]
+//   [/bash]
+//
+// Nothing in the text says whether `bash` is a tool or ordinary prose, so the
+// live tool schemas decide: the element name must be a tool pi offered, and
+// every child must be one of that tool's declared properties. Unknown children
+// are dropped rather than sent as bogus arguments. `recoverySpecs` holds the
+// schemas from the request that produced this stream.
+
+type ToolSpec = {
+	name: string;
+	properties: Map<string, { type?: string; items?: { type?: string } }>;
+	required: string[];
+};
+
+let recoverySpecs: ToolSpec[] = [];
+
+function setRecoverySpecs(specs: ToolSpec[]): void {
+	recoverySpecs = specs;
+}
+
+function escapeRegExp(literal: string): string {
+	return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function toolBlockRe(name: string): RegExp {
+	const TAG = escapeRegExp(name);
+	return new RegExp(
+		`<\\s*${TAG}\\s*>([\\s\\S]*?)<\\s*\\/\\s*${TAG}\\s*>`,
+		"gi",
+	);
+}
+
+function readSchema(schemaJson: unknown, name: string): ToolSpec | null {
+	try {
+		const schema =
+			typeof schemaJson === "string" ? JSON.parse(schemaJson) : schemaJson;
+		const props = (schema as { properties?: Record<string, unknown> })
+			?.properties;
+		if (!props || typeof props !== "object") return null;
+		const required = (schema as { required?: unknown }).required;
+		return {
+			name,
+			properties: new Map(
+				Object.entries(props).map(([key, value]) => [
+					key,
+					(value ?? {}) as { type?: string; items?: { type?: string } },
+				]),
+			),
+			required: Array.isArray(required)
+				? required.filter((key): key is string => typeof key === "string")
+				: [],
+		};
+	} catch {
+		return null;
+	}
+}
+
+// Build the schemas for the tools in the outgoing request so the text pass can
+// tell a tool block from prose.
+function recoverySpecsFrom(tools: Array<{ name: string; input_schema?: unknown }>): ToolSpec[] {
+	const specs: ToolSpec[] = [];
+	for (const tool of tools) {
+		const spec = readSchema(tool.input_schema, tool.name);
+		if (spec) specs.push(spec);
+	}
+	return specs;
+}
+
+// Read one property value into the JSON type its schema declares.
+function coerceTypedValue(
+	raw: string,
+	schema: { type?: string; items?: { type?: string } },
+): unknown {
+	const value = raw.trim();
+	const decoded = decodeAttributeValue(value);
+
+	if (schema.type === "array") {
+		if (!value) return [];
+		try {
+			const parsed = JSON.parse(value);
+			if (Array.isArray(parsed)) return parsed;
+		} catch {
+			// Not JSON; fall through to the line/newline forms below.
+		}
+		return decoded
+			.split("\n")
+			.map((line) => line.trim())
+			.filter(Boolean);
+	}
+
+	if (schema.type === "number" || schema.type === "integer") {
+		const parsed = Number(value);
+		return Number.isFinite(parsed) ? parsed : decoded;
+	}
+
+	if (schema.type === "boolean") {
+		if (value === "true") return true;
+		if (value === "false") return false;
+	}
+
+	if (schema.type === "object") {
+		try {
+			return JSON.parse(value);
+		} catch {
+			return decoded;
+		}
+	}
+
+	return decoded;
+}
+
+// Collect the child elements of a tool block, keeping only declared properties.
+function collectTypedArguments(body: string, spec: ToolSpec): Record<string, unknown> {
+	const args: Record<string, unknown> = {};
+	for (const [name, schema] of spec.properties) {
+		const TAG = escapeRegExp(name);
+		const match = new RegExp(
+			`<\\s*${TAG}(?:\\s[^>]*)?>([\\s\\S]*?)<\\s*\\/\\s*${TAG}\\s*>`,
+			"i",
+		).exec(body);
+		// An empty child element still means the caller sent a value.
+		if (!match) continue;
+		args[name] = coerceTypedValue(match[1] ?? "", schema);
+	}
+	return args;
+}
+
+// Recover tool blocks that name the tool as the element. Only an element that
+// matches a live tool name counts, and it needs at least one declared child.
+//
+// The model sometimes skips the child element and puts the value straight in
+// the body instead:
+//
+//   [LT]bash[GT]pwd[/bash]
+//
+// That is only unambiguous when the tool takes exactly one required property
+// and the body is not itself markup, so both conditions are required.
+function recoverToolBlocks(
+	text: string,
+	specs: ToolSpec[],
+): RecoveredToolCall[] {
+	const calls: RecoveredToolCall[] = [];
+	for (const spec of specs) {
+		const BLOCK_RE = toolBlockRe(spec.name);
+		BLOCK_RE.lastIndex = 0;
+		let block: RegExpExecArray | null;
+		while ((block = BLOCK_RE.exec(text)) !== null) {
+			const body = block[1] ?? "";
+			const args = collectTypedArguments(body, spec);
+			if (Object.keys(args).length > 0) {
+				calls.push({ name: spec.name, arguments: args });
+				continue;
+			}
+
+			if (spec.required.length !== 1) continue;
+			const sole = spec.required[0];
+			const schema = spec.properties.get(sole);
+			if (!schema) continue;
+			// Child markup means the element form was intended but malformed.
+			if (/<\s*\/?\s*[A-Za-z_]/.test(body)) continue;
+			const value = body.trim();
+			if (!value) continue;
+			// A bare tag in mid-sentence is prose about the markup, not a call. The
+			// model starts a real one on its own line.
+			const before = text.slice(0, block.index);
+			if (!/(^|\n)[ \t]*$/.test(before)) continue;
+			calls.push({
+				name: spec.name,
+				arguments: { [sole]: coerceTypedValue(value, schema) },
+			});
+		}
+	}
+	return calls;
 }
 
 type RecoveredToolCall = { name: string; arguments: Record<string, unknown> };
 
-// Parse every tool call in a text block, in both the DSML invoke shape and the
-// function-envelope shape. Returns [] when the text has no usable markup, so
-// callers can leave ordinary prose alone.
-function recoverToolCalls(text: string): RecoveredToolCall[] {
+// A tool block whose body is a bare `Name: value` line rather than a child
+// element, as in:
+//
+//   [LT]tool_call[GT]
+//   Bash: echo HELLO_REAL
+//   [/tool_call]
+//
+// The name is matched case-insensitively against the live tools, so `Bash`
+// resolves to pi's `bash` instead of being dropped as unknown.
+const NAME_LINE_RE = /^\s*([A-Za-z_][\w.-]*)\s*:\s*([\s\S]*)$/;
+
+function recoverNameLineBlocks(
+	text: string,
+	specs: ToolSpec[],
+): RecoveredToolCall[] {
+	const calls: RecoveredToolCall[] = [];
+	const byLower = new Map(specs.map((spec) => [spec.name.toLowerCase(), spec]));
+	const WRAPPER_RE = /<\s*tool_call\s*>([\s\S]*?)<\s*\/\s*tool_call\s*>/gi;
+	let wrapper: RegExpExecArray | null;
+	while ((wrapper = WRAPPER_RE.exec(text)) !== null) {
+		const match = NAME_LINE_RE.exec(wrapper[1] ?? "");
+		if (!match) continue;
+		const spec = byLower.get(match[1].toLowerCase());
+		if (!spec) continue;
+		const value = (match[2] ?? "").trim();
+		if (!value) continue;
+		if (spec.required.length !== 1) continue;
+		const sole = spec.required[0];
+		const schema = spec.properties.get(sole);
+		if (!schema) continue;
+		calls.push({ name: spec.name, arguments: { [sole]: coerceTypedValue(value, schema) } });
+	}
+	return calls;
+}
+
+// Parse every tool call in a text block, in the DSML invoke shape, the
+// function-envelope shape, and the schema-matched tool-element shape. Returns
+// [] when the text has no usable markup, so callers can leave ordinary prose
+// alone.
+function recoverToolCalls(
+	text: string,
+	specs: ToolSpec[] = recoverySpecs,
+): RecoveredToolCall[] {
 	const calls: RecoveredToolCall[] = [];
 
 	INVOKE_RE.lastIndex = 0;
@@ -531,15 +754,19 @@ function recoverToolCalls(text: string): RecoveredToolCall[] {
 		calls.push({ name, arguments: collectArguments(body) });
 	}
 
+	calls.push(...recoverToolBlocks(text, specs));
+	calls.push(...recoverNameLineBlocks(text, specs));
+
 	return calls;
 }
 
 // Strip the markup out of a text block so the leftover prose is not duplicated
 // alongside the recovered tool calls.
-function stripToolMarkup(text: string): string {
-	return text
-		.replace(INVOKE_RE, "")
-		.replace(FUNCTION_RE, "")
+function stripToolMarkup(text: string, specs: ToolSpec[] = recoverySpecs): string {
+	let stripped = text.replace(INVOKE_RE, "").replace(FUNCTION_RE, "");
+	stripped = stripped.replace(/<\s*tool_call\s*>[\s\S]*?<\s*\/\s*tool_call\s*>/gi, "");
+	for (const spec of specs) stripped = stripped.replace(toolBlockRe(spec.name), "");
+	return stripped
 		.replace(STRIP_TAG_RE, "")
 		.replace(/[ \t]+\n/g, "\n")
 		.replace(/\n{3,}/g, "\n\n")
@@ -704,6 +931,7 @@ function streamCommandCode(
 				description: t.description,
 				input_schema: t.parameters,
 			}));
+			setRecoverySpecs(recoverySpecsFrom(tools));
 
 			const body = {
 				config: staticConfig(),
@@ -958,12 +1186,12 @@ function streamCommandCode(
 				for (let idx = 0; idx < output.content.length; idx++) {
 					const block = output.content[idx];
 					if (block.type !== "text") continue;
-					if (!looksLikeToolMarkup(block.text)) continue;
+					if (!looksLikeToolMarkup(block.text, recoverySpecs)) continue;
 
-					const recovered = recoverToolCalls(block.text);
+					const recovered = recoverToolCalls(block.text, recoverySpecs);
 					if (recovered.length === 0) continue;
 
-					const residue = stripToolMarkup(block.text);
+					const residue = stripToolMarkup(block.text, recoverySpecs);
 					if (residue) {
 						block.text = residue;
 					} else {
